@@ -17,7 +17,7 @@ case "$ID" in ubuntu|debian) ok "OS: $PRETTY_NAME";; *) die "unsupported: $ID";;
 # ------------------------------------------------------------------
 # Repo URL
 # ------------------------------------------------------------------
-REPO_URL="https://github.com/richpric/glowing-funicular.git"
+REPO_URL="https://github.com/spideragentai/Panel-.git"
 
 echo
 echo "${BLD}=== PRIV L7 HUB — installer ===${RST}"
